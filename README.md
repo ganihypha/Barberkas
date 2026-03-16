@@ -1,4 +1,4 @@
-# BarberKas v1.0
+# BarberKas v1.4
 
 ## Sistem Kas & Antrian Barbershop via WhatsApp
 
@@ -8,8 +8,11 @@ BarberKas adalah micro-SaaS yang membantu barbershop Indonesia mengelola transak
 
 - **Production**: https://barberkas.pages.dev
 - **Dashboard**: https://barberkas.pages.dev/
+- **Webhook Tester**: https://barberkas.pages.dev/webhook-test
 - **API Health**: https://barberkas.pages.dev/api/health
 - **Webhook Fonnte**: https://barberkas.pages.dev/api/webhook/fonnte
+- **Webhook Logs**: https://barberkas.pages.dev/api/webhook/logs
+- **Webhook Stats**: https://barberkas.pages.dev/api/webhook/stats
 - **GitHub**: https://github.com/ganihypha/Barberkas
 
 ## Fitur yang Sudah Jadi
@@ -21,6 +24,13 @@ BarberKas adalah micro-SaaS yang membantu barbershop Indonesia mengelola transak
 - **KOMISI** — Lihat komisi pribadi barber hari ini
 - **ANTRI** — Cek estimasi antrian (sepi/agak rame/rame)
 - **HELP** — Tampilkan menu perintah
+
+### Smart Message Filtering (v1.4)
+- **Group messages** (sender `120xxx`) automatically skipped — no wasted Fonnte quota
+- **Bot echo detection** — self-replies from device number are ignored
+- **Non-text messages** (stickers, images, etc.) skipped gracefully
+- **Long random messages** (>50 chars, not a command) don't trigger auto-reply
+- **Short unknown messages** (<50 chars) get a friendly "ketik HELP" hint
 
 ### Web Dashboard
 - Ringkasan harian (total potong, revenue, komisi, profit owner)
@@ -45,7 +55,12 @@ BarberKas adalah micro-SaaS yang membantu barbershop Indonesia mengelola transak
 | `/api/barbers` | POST | Tambah barber |
 | `/api/barbers/:id` | DELETE | Hapus barber |
 | `/api/send-report` | POST | Kirim laporan ke WA owner |
+| `/api/webhook/fonnte` | GET | Webhook verification (returns status) |
 | `/api/webhook/fonnte` | POST | Webhook receiver dari Fonnte |
+| `/api/webhook/logs` | GET | Log webhook (query: ?limit=30&action=help) |
+| `/api/webhook/stats` | GET | Stats breakdown (sent/failed/skipped) |
+| `/api/test/fonnte-config` | GET | Check Fonnte token status |
+| `/api/test/fonnte-send` | POST | Direct Fonnte Send API test |
 
 ## Tech Stack
 
@@ -61,25 +76,66 @@ BarberKas adalah micro-SaaS yang membantu barbershop Indonesia mengelola transak
 ### Tables (Supabase)
 - **transactions**: id, barber_name, barber_phone, service, price, tx_date, customer_phone, created_at
 - **barbers**: id, name, phone, created_at
+- **webhook_logs**: id, sender, sender_name, message, device, content_type, raw_keys, action, reply_status, error, created_at
 
-## Cara Setup (Untuk Barbershop Baru)
+## Bug Fixes & Root Cause Analysis (v1.2 - v1.4)
 
-### 1. Setup Fonnte
-1. Login ke [fonnte.com](https://fonnte.com)
-2. Tambah device baru → Scan QR code dengan WhatsApp
-3. Buka Settings → Paste webhook URL: `https://barberkas.pages.dev/api/webhook/fonnte`
-4. Matikan Autoreply (supaya bot yang handle)
-5. Save
+### v1.4 — Critical Fonnte API Fixes (CURRENT)
 
-### 2. Daftarkan Barber
+**Root Cause of `send_failed:invalid/empty body value`:**
+
+Through systematic API testing, discovered that **Fonnte Send API has strict JSON type requirements**:
+
+| Payload | Result |
+|---|---|
+| `{"target":"628xxx","message":"test"}` | ✅ Success |
+| `{"target":"628xxx","message":"test","inboxid":""}` | ❌ `invalid/empty body value` |
+| `{"target":"628xxx","message":"test","inboxid":"12345"}` | ❌ `invalid/empty body value` |
+| `{"target":"628xxx","message":"test","inboxid":12345}` | ✅ Works (number type) |
+| `{"target":"628xxx","message":"test","typing":"false"}` | ❌ `invalid/empty body value` |
+| `{"target":"120xxx","message":"test"}` | ❌ `target input invalid` |
+
+**Fixes applied:**
+1. **inboxid must be NUMBER type** — `parseInt(inboxid, 10)` instead of string; omit entirely if empty/invalid
+2. **Removed `typing: false`** from payload — was string-coerced causing rejection
+3. **Skip group messages** — sender `120xxx` cannot receive Fonnte Send (group JID format)
+4. **Skip bot echoes** — detect when sender === device number (self-reply loop)
+5. **Skip non-text messages** — "non-text message" from media/stickers
+6. **Skip long random messages** — >50 chars non-command messages don't trigger auto-reply
+7. **Full Fonnte API response logging** — every send captures raw response for debugging
+
+### v1.3 — inboxid Empty String Fix
+- Empty string `inboxid` causes Fonnte rejection; only include if numeric (`/^[1-9]\d*$/`)
+
+### v1.2 — JSON Parsing & Supabase Logging
+- Fixed JSON body parsing (Fonnte sends JSON, not form-data)
+- Persistent webhook logs in Supabase (not in-memory)
+- InboxID threading for proper reply context
+
+## Cara Setup Fonnte (PENTING!)
+
+### Settings di Edit Device (md.fonnte.com)
+1. **Webhook URL**: `https://barberkas.pages.dev/api/webhook/fonnte`
+2. **Autoread**: `ON` (WAJIB — tanpa ini webhook tidak trigger)
+3. **Response Source**: `Autoreply` (BUKAN Flow!)
+4. **Webhook Connect**: kosongkan
+5. **Webhook Message Status**: kosongkan
+6. **Webhook Chaining**: kosongkan
+7. **Personal**: `ON`
+8. **Group**: `ON` (bot akan skip otomatis, tapi tetap log)
+9. **Silent Read**: `ON` (opsional)
+10. **Inbox**: `ON` (opsional)
+
+### Daftarkan Barber
 1. Buka dashboard: https://barberkas.pages.dev
 2. Klik "Tambah Barber" → Isi nama dan nomor WA (format: 628xxx)
 3. Ulangi untuk setiap barber
 
-### 3. Test
-1. Kirim WA dari HP barber ke nomor Fonnte: `POTONG 30000`
-2. Harusnya dapat reply: "Tercatat! Barber: [nama]..."
-3. Cek dashboard — transaksi harus muncul
+### Test
+1. Kirim WA dari HP lain ke nomor Fonnte: `HELP`
+2. Harusnya dapat reply menu perintah
+3. Coba: `POTONG 30000 FADE`
+4. Cek log: https://barberkas.pages.dev/api/webhook/logs
 
 ## Perintah WhatsApp
 
@@ -105,6 +161,23 @@ BarberKas adalah micro-SaaS yang membantu barbershop Indonesia mengelola transak
 | OWNER_PHONE | Nomor WA owner (628xxx) |
 | KOMISI_PERSEN | Persentase komisi barber (default: 50) |
 
+## Monitoring
+
+### Check webhook health:
+```bash
+# Stats breakdown
+curl https://barberkas.pages.dev/api/webhook/stats
+
+# Recent logs
+curl https://barberkas.pages.dev/api/webhook/logs?limit=10
+
+# Filter by action
+curl https://barberkas.pages.dev/api/webhook/logs?action=help
+
+# Test Fonnte token
+curl https://barberkas.pages.dev/api/test/fonnte-config
+```
+
 ## Development
 
 ```bash
@@ -129,9 +202,12 @@ npm run deploy:prod
 - [ ] Integrasi pembayaran (QRIS)
 - [ ] Customer loyalty program
 - [ ] Manajemen inventory (pomade, wax, dll)
+- [ ] Auto-reply data store (Supabase-backed keyword responses)
+- [ ] Webhook Connect/Message Status/Chaining support
 
 ## Deployment
 
 - **Platform**: Cloudflare Pages
-- **Status**: Active
-- **Last Updated**: 15 Maret 2026
+- **Status**: ✅ Active
+- **Project Name**: barberkas
+- **Last Updated**: 16 Maret 2026

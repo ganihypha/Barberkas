@@ -93,12 +93,39 @@ app.post('/api/webhook/test', async (c) => {
 // Webhook logs - stored in Supabase for persistence
 app.get('/api/webhook/logs', async (c) => {
   const env = c.env
+  const limit = parseInt(c.req.query('limit') || '30')
+  const action = c.req.query('action') || ''
   try {
-    const logs = await supabaseQuery(env, 'webhook_logs', 'GET', null,
-      'select=*&order=created_at.desc&limit=30')
+    let query = `select=*&order=created_at.desc&limit=${Math.min(limit, 100)}`
+    if (action) query += `&action=eq.${action}`
+    const logs = await supabaseQuery(env, 'webhook_logs', 'GET', null, query)
     return c.json({ total: (logs || []).length, logs: logs || [] })
   } catch {
     return c.json({ total: 0, logs: [] })
+  }
+})
+
+// Webhook stats - error breakdown
+app.get('/api/webhook/stats', async (c) => {
+  const env = c.env
+  try {
+    const allLogs = await supabaseQuery(env, 'webhook_logs', 'GET', null,
+      'select=action,reply_status&order=created_at.desc&limit=200')
+    
+    const stats: Record<string, number> = {}
+    for (const log of (allLogs || [])) {
+      const key = `${log.action}:${log.reply_status}`
+      stats[key] = (stats[key] || 0) + 1
+    }
+    
+    const total = (allLogs || []).length
+    const sent = (allLogs || []).filter((l: any) => l.reply_status === 'sent' || l.reply_status === 'recorded').length
+    const failed = (allLogs || []).filter((l: any) => l.reply_status?.startsWith('send_failed')).length
+    const skipped = (allLogs || []).filter((l: any) => l.reply_status?.startsWith('skipped')).length
+    
+    return c.json({ total, sent, failed, skipped, breakdown: stats })
+  } catch {
+    return c.json({ total: 0, sent: 0, failed: 0, skipped: 0, breakdown: {} })
   }
 })
 
@@ -173,23 +200,38 @@ async function supabaseQuery(env: Bindings, table: string, method: string, body?
 // ============================================
 async function sendWhatsApp(env: Bindings, target: string, message: string, inboxid?: string): Promise<{status: boolean; detail?: string; reason?: string; id?: string; raw?: string}> {
   try {
+    // CRITICAL: Fonnte Send API rules (discovered by testing):
+    // 1. inboxid MUST be a NUMBER type in JSON, NOT a string → string causes "invalid/empty body value"
+    // 2. inboxid: "" (empty string) → "invalid/empty body value"
+    // 3. inboxid: "12345" (string) → "invalid/empty body value" 
+    // 4. inboxid: 12345 (number) → works (or "unknown inbox id" if wrong)
+    // 5. Omitting inboxid entirely → works fine
+    // 6. Target "120xxxxx" (group JID) → "target input invalid"
+    // 7. typing: false (boolean) → works; typing: "false" (string) → fails
+    
     const payload: any = {
       target: target,
-      message: message,
-      typing: false
+      message: message
     }
-    // If we have inboxid, include it for proper reply threading
-    // Only include if it looks like a valid numeric inboxid from Fonnte
-    if (inboxid && /^\d+$/.test(inboxid)) {
-      payload.inboxid = inboxid
+    
+    // ONLY include inboxid if it's a valid positive numeric value
+    // Convert to NUMBER type (not string!) because Fonnte rejects string inboxid
+    if (inboxid && /^[1-9]\d*$/.test(inboxid)) {
+      payload.inboxid = parseInt(inboxid, 10)  // NUMBER, not string!
     }
     
     const token = env.FONNTE_TOKEN || ''
-    console.log(`[FONNTE SEND] target=${target}, msgLen=${message.length}, inboxid=${inboxid || 'none'}, tokenLen=${token.length}`)
+    console.log(`[FONNTE SEND] target=${target}, msgLen=${message.length}, inboxid=${inboxid || 'none'} (included=${!!payload.inboxid}), tokenLen=${token.length}`)
+    console.log(`[FONNTE SEND] payload: ${JSON.stringify(payload).substring(0, 300)}`)
     
     if (!token) {
       console.error('[FONNTE SEND] ERROR: FONNTE_TOKEN is empty!')
       return { status: false, reason: 'FONNTE_TOKEN not configured' }
+    }
+    
+    if (!target || !message) {
+      console.error(`[FONNTE SEND] ERROR: empty target or message! target="${target}", msgLen=${message.length}`)
+      return { status: false, reason: 'empty target or message' }
     }
     
     const res = await fetch('https://api.fonnte.com/send', {
@@ -327,13 +369,15 @@ app.post('/api/webhook/fonnte', async (c) => {
     const inboxid = String(body.inboxid || '')
     const member = String(body.member || '')  // group sender
     const timestamp = String(body.timestamp || '')
+    const isgroup = String(body.isgroup || '').toLowerCase()
+    const isforwarded = String(body.isforwarded || '').toLowerCase()
     
-    console.log(`[WEBHOOK] parseMethod=${parseMethod}, sender=${sender}, name="${name}", message="${message}", device=${device}, inboxid=${inboxid}`)
+    console.log(`[WEBHOOK] parseMethod=${parseMethod}, sender=${sender}, name="${name}", message="${message.substring(0, 80)}", device=${device}, inboxid=${inboxid}, isgroup=${isgroup}`)
     console.log(`[WEBHOOK] Body keys: ${Object.keys(body).join(', ')}`)
     
     // STEP 3: Log to Supabase for persistent debugging
     const logEntry = {
-      contentType, sender, senderName: name, message, device,
+      contentType, sender, senderName: name, message: message.substring(0, 500), device,
       rawKeys: Object.keys(body), action: '', replyStatus: '', error: ''
     }
     
@@ -343,6 +387,36 @@ app.post('/api/webhook/fonnte', async (c) => {
       logEntry.error = `empty: message="${message}", sender="${sender}"`
       await logWebhook(env, logEntry)
       return c.json({ status: 'ignored', reason: 'empty message or sender' })
+    }
+    
+    // FILTER 1: Skip GROUP messages (sender starts with 120xxx or isgroup=true)
+    // Group JIDs cannot be used as Fonnte Send target — causes "target input invalid"
+    if (sender.startsWith('120') || isgroup === 'true' || isgroup === '1') {
+      logEntry.action = 'skipped_group'
+      logEntry.replyStatus = 'skipped'
+      logEntry.error = `group message from ${name} (sender=${sender}, isgroup=${isgroup})`
+      await logWebhook(env, logEntry)
+      return c.json({ status: 'ok', action: 'skipped_group', reason: 'group messages are not processed' })
+    }
+    
+    // FILTER 2: Skip bot echo / self-reply messages
+    // When the bot sends a reply, Fonnte may webhook it back as a new message from the device
+    // Detect by: sender == device number (after normalization), or message contains bot signature
+    const normalizedDevice = device.replace(/^0/, '62').replace(/[^0-9]/g, '')
+    if (sender === normalizedDevice) {
+      logEntry.action = 'skipped_self'
+      logEntry.replyStatus = 'skipped'
+      logEntry.error = 'message from own device (bot echo)'
+      await logWebhook(env, logEntry)
+      return c.json({ status: 'ok', action: 'skipped_self', reason: 'self-message ignored' })
+    }
+    
+    // FILTER 3: Skip "non-text message" (media/stickers/etc without actual text)
+    if (message === 'non-text message') {
+      logEntry.action = 'skipped_nontext'
+      logEntry.replyStatus = 'skipped'
+      await logWebhook(env, logEntry)
+      return c.json({ status: 'ok', action: 'skipped_nontext', reason: 'non-text messages are not processed' })
     }
     
     // STEP 4: Process commands
@@ -385,11 +459,19 @@ app.post('/api/webhook/fonnte', async (c) => {
         result = sendResult?.status ? 'sent' : `send_failed:${sendResult?.reason || sendResult?.detail || JSON.stringify(sendResult).substring(0, 200)}`
       }
       // DEFAULT - unknown command
+      // Only reply with menu hint for short messages that look like intended commands
+      // Skip long random messages (chat noise) to avoid spamming
       else {
         action = 'default'
-        const sendResult = await sendWhatsApp(env, sender,
-          `Halo ${name || 'Bro'}! Saya *BarberKas Bot* 💈\n\nKetik *HELP* untuk lihat menu perintah.`, inboxid)
-        result = sendResult?.status ? 'sent' : `send_failed:${sendResult?.reason || sendResult?.detail || JSON.stringify(sendResult).substring(0, 200)}`
+        if (message.length <= 50) {
+          // Short message — might be a typo or intended command, send hint
+          const sendResult = await sendWhatsApp(env, sender,
+            `Halo ${name || 'Bro'}! Saya *BarberKas Bot* 💈\n\nKetik *HELP* untuk lihat menu perintah.`, inboxid)
+          result = sendResult?.status ? 'sent' : `send_failed:${sendResult?.reason || sendResult?.detail || JSON.stringify(sendResult).substring(0, 200)}`
+        } else {
+          // Long message — probably regular chat, don't reply
+          result = 'skipped_long_msg'
+        }
       }
     } catch (handlerErr: any) {
       console.error(`[WEBHOOK] Handler error for action=${action}:`, handlerErr.message)
