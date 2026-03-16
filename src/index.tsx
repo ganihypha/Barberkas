@@ -311,8 +311,13 @@ function getNowJakarta(): Date {
 function formatDateIndo(dateStr: string): string {
   const days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu']
   const months = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember']
-  const d = new Date(dateStr + 'T00:00:00+07:00')
-  return `${days[d.getDay()]}, ${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`
+  // Parse date string directly to avoid timezone issues
+  const parts = dateStr.split('-')
+  const year = parseInt(parts[0])
+  const month = parseInt(parts[1]) - 1
+  const day = parseInt(parts[2])
+  const d = new Date(year, month, day)
+  return `${days[d.getDay()]}, ${day} ${months[month]} ${year}`
 }
 
 // ============================================
