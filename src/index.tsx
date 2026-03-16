@@ -23,38 +23,57 @@ type Transaction = {
   created_at?: string
 }
 
+// Fonnte webhook payload (from docs.fonnte.com/webhook-reply-message)
+type FonnteWebhookPayload = {
+  device: string       // Device number
+  sender: string       // Sender's WhatsApp number
+  message: string      // The message text
+  text?: string        // Button text message
+  member?: string      // Group member who sent
+  name?: string        // Sender's name
+  location?: string    // Latitude,longitude
+  pollname?: string    // Poll name
+  choices?: string     // Selected poll choices
+  url?: string         // Attachment URL
+  filename?: string    // Attachment filename
+  extension?: string   // Attachment extension
+  timestamp?: string   // Message timestamp
+  inboxid?: string     // Inbox ID for replying
+}
+
 const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('/api/*', cors())
 
 // ============================================
-// WEBHOOK DEBUG & TEST ENDPOINTS
+// WEBHOOK DEBUG & TEST ENDPOINTS  
 // ============================================
 
-// GET handler for webhook URL verification (Fonnte may ping this)
+// GET handler for webhook URL verification
 app.get('/api/webhook/fonnte', (c) => {
   return c.json({
     status: 'ok',
     message: 'BarberKas Webhook is active',
-    info: 'Send POST requests to this URL from Fonnte',
+    info: 'Fonnte sends POST with JSON body to this URL',
     timestamp: new Date().toISOString()
   })
 })
 
-// Debug endpoint to test webhook without Fonnte
+// Debug endpoint - echoes whatever is received
 app.post('/api/webhook/test', async (c) => {
-  const env = c.env
   try {
     const contentType = c.req.header('content-type') || ''
-    let rawBody = ''
-    let parsedData: any = {}
+    let body: any = {}
     
-    if (contentType.includes('application/json')) {
-      parsedData = await c.req.json()
-      rawBody = JSON.stringify(parsedData)
-    } else {
-      parsedData = await c.req.parseBody()
-      rawBody = JSON.stringify(parsedData)
+    // Try JSON first (Fonnte default), then form-data as fallback
+    try {
+      body = await c.req.json()
+    } catch {
+      try {
+        body = await c.req.parseBody()
+      } catch {
+        body = { error: 'Could not parse body' }
+      }
     }
     
     return c.json({
@@ -62,13 +81,7 @@ app.post('/api/webhook/test', async (c) => {
       received: {
         contentType,
         headers: Object.fromEntries(c.req.raw.headers.entries()),
-        body: parsedData,
-        rawBody
-      },
-      webhook_would_process: {
-        message: parsedData.message || parsedData.pesan || '',
-        sender: parsedData.sender || parsedData.pengirim || '',
-        device: parsedData.device || ''
+        body
       },
       timestamp: new Date().toISOString()
     })
@@ -77,14 +90,16 @@ app.post('/api/webhook/test', async (c) => {
   }
 })
 
-// Webhook activity log (last 20 events, in-memory for debugging)
-const webhookLogs: any[] = []
-
-app.get('/api/webhook/logs', (c) => {
-  return c.json({
-    total: webhookLogs.length,
-    logs: webhookLogs.slice(-20).reverse()
-  })
+// Webhook logs - stored in Supabase for persistence
+app.get('/api/webhook/logs', async (c) => {
+  const env = c.env
+  try {
+    const logs = await supabaseQuery(env, 'webhook_logs', 'GET', null,
+      'select=*&order=created_at.desc&limit=30')
+    return c.json({ total: (logs || []).length, logs: logs || [] })
+  } catch {
+    return c.json({ total: 0, logs: [] })
+  }
 })
 
 // ============================================
@@ -116,27 +131,56 @@ async function supabaseQuery(env: Bindings, table: string, method: string, body?
 
 // ============================================
 // FONNTE HELPERS
+// Based on: https://docs.fonnte.com/webhook-reply-message/
+// and: https://docs.fonnte.com/api-send-message/
 // ============================================
-async function sendWhatsApp(env: Bindings, target: string, message: string) {
+async function sendWhatsApp(env: Bindings, target: string, message: string, inboxid?: string) {
   try {
+    const payload: any = {
+      target: target,
+      message: message,
+      typing: false
+    }
+    // If we have inboxid, include it for proper reply threading
+    if (inboxid) {
+      payload.inboxid = inboxid
+    }
+    
+    console.log(`[FONNTE SEND] target=${target}, message length=${message.length}, inboxid=${inboxid || 'none'}`)
+    
     const res = await fetch('https://api.fonnte.com/send', {
       method: 'POST',
       headers: {
         'Authorization': env.FONNTE_TOKEN,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        target: target,
-        message: message,
-        typing: false
-      })
+      body: JSON.stringify(payload)
     })
     const data = await res.json() as any
-    console.log('Fonnte response:', JSON.stringify(data))
+    console.log(`[FONNTE SEND] Response: status=${data.status}, detail=${data.detail || data.reason || 'ok'}`)
     return data
+  } catch (e: any) {
+    console.error('[FONNTE SEND] Error:', e.message)
+    return { status: false, reason: e.message }
+  }
+}
+
+// Save webhook log to Supabase for persistent debugging
+async function logWebhook(env: Bindings, entry: any) {
+  try {
+    await supabaseQuery(env, 'webhook_logs', 'POST', {
+      sender: entry.sender || '',
+      sender_name: entry.senderName || '',
+      message: entry.message || '',
+      device: entry.device || '',
+      content_type: entry.contentType || '',
+      raw_keys: (entry.rawKeys || []).join(','),
+      action: entry.action || '',
+      reply_status: entry.replyStatus || '',
+      error: entry.error || ''
+    })
   } catch (e) {
-    console.error('Fonnte error:', e)
-    return null
+    console.error('[LOG] Failed to save webhook log:', e)
   }
 }
 
@@ -171,95 +215,137 @@ function formatDateIndo(dateStr: string): string {
 
 // ============================================
 // WEBHOOK - Fonnte WhatsApp Incoming
+// Based on: https://docs.fonnte.com/webhook-reply-message/
+//
+// IMPORTANT FONNTE SETTINGS (di Edit Device):
+// 1. Autoread = ON (WAJIB, tanpa ini webhook gak trigger)
+// 2. Response Source = Autoreply (BUKAN Flow!)
+// 3. Webhook URL = https://barberkas.pages.dev/api/webhook/fonnte
+// 4. Webhook Connect, Message Status, Chaining = KOSONGKAN
+//
+// Fonnte sends JSON body:
+// { device, sender, message, text, member, name,
+//   location, pollname, choices, url, filename,
+//   extension, timestamp, inboxid }
 // ============================================
 app.post('/api/webhook/fonnte', async (c) => {
   const env = c.env
+  const contentType = c.req.header('content-type') || ''
+  let body: any = {}
+  let parseMethod = 'unknown'
+  
   try {
-    // Fonnte can send as form-data OR JSON depending on config
-    const contentType = c.req.header('content-type') || ''
-    let body: any = {}
-    
-    if (contentType.includes('application/json')) {
-      body = await c.req.json()
-    } else {
-      body = await c.req.parseBody()
+    // STEP 1: Parse the incoming body
+    // Fonnte sends as application/json (confirmed from docs)
+    // But we handle form-data too as fallback
+    try {
+      const cloned = c.req.raw.clone()
+      const rawText = await cloned.text()
+      console.log(`[WEBHOOK RAW] Content-Type: ${contentType}`)
+      console.log(`[WEBHOOK RAW] Body: ${rawText.substring(0, 500)}`)
+      
+      // Try JSON parse first
+      try {
+        body = JSON.parse(rawText)
+        parseMethod = 'json'
+      } catch {
+        // If JSON fails, try form-data parsing
+        body = await c.req.parseBody()
+        parseMethod = 'form-data'
+      }
+    } catch (parseErr: any) {
+      console.error(`[WEBHOOK] Parse error: ${parseErr.message}`)
+      return c.json({ status: 'error', reason: 'Could not parse request body' }, 400)
     }
     
-    // Fonnte field names (support both old and new API formats)
-    const message = (body.message || body.pesan || body.text || '').toString().trim()
-    const sender = (body.sender || body.pengirim || body.from || '').toString().replace(/[^0-9]/g, '')
-    const device = (body.device || body.perangkat || '').toString()
-    const name = (body.name || body.nama || '').toString()
+    // STEP 2: Extract Fonnte fields
+    // Reference: https://docs.fonnte.com/webhook-reply-message/
+    const message = String(body.message || '').trim()
+    const sender = String(body.sender || '').replace(/[^0-9]/g, '')
+    const device = String(body.device || '')
+    const name = String(body.name || '')
+    const inboxid = String(body.inboxid || '')
+    const member = String(body.member || '')  // group sender
+    const timestamp = String(body.timestamp || '')
     
-    // Log for debugging
+    console.log(`[WEBHOOK] parseMethod=${parseMethod}, sender=${sender}, name="${name}", message="${message}", device=${device}, inboxid=${inboxid}`)
+    console.log(`[WEBHOOK] Body keys: ${Object.keys(body).join(', ')}`)
+    
+    // STEP 3: Log to Supabase for persistent debugging
     const logEntry = {
-      timestamp: new Date().toISOString(),
-      contentType,
-      sender,
-      senderName: name,
-      message,
-      device,
-      rawKeys: Object.keys(body),
-      processed: true
+      contentType, sender, senderName: name, message, device,
+      rawKeys: Object.keys(body), action: '', replyStatus: '', error: ''
     }
-    webhookLogs.push(logEntry)
-    if (webhookLogs.length > 50) webhookLogs.shift()
     
-    console.log(`[WEBHOOK] sender=${sender}, name="${name}", message="${message}", device=${device}, contentType=${contentType}`)
-    console.log(`[WEBHOOK] Raw body keys: ${Object.keys(body).join(', ')}`)
-    
+    // Ignore empty messages or no sender
     if (!message || !sender) {
+      logEntry.action = 'ignored'
+      logEntry.error = `empty: message="${message}", sender="${sender}"`
+      await logWebhook(env, logEntry)
       return c.json({ status: 'ignored', reason: 'empty message or sender' })
     }
     
+    // STEP 4: Process commands
     const upperMsg = message.toUpperCase().trim()
+    let action = 'default'
+    let result = ''
     
-    // FLOW: POTONG / CATAT TRANSAKSI
-    if (upperMsg.startsWith('POTONG') || upperMsg.startsWith('P ')) {
-      const result = await handlePotong(env, upperMsg, sender)
-      return c.json({ status: 'ok', action: 'potong', result })
+    try {
+      // POTONG / CATAT TRANSAKSI
+      if (upperMsg.startsWith('POTONG') || upperMsg.startsWith('P ')) {
+        action = 'potong'
+        result = await handlePotong(env, upperMsg, sender, inboxid)
+      }
+      // TOTAL / LAPORAN
+      else if (upperMsg === 'TOTAL' || upperMsg === 'LAPORAN' || upperMsg === 'LAP') {
+        action = 'laporan'
+        result = await handleLaporan(env, sender, inboxid)
+      }
+      // ANTRI / ANTRIAN
+      else if (upperMsg === 'ANTRI' || upperMsg === 'ANTRIAN') {
+        action = 'antrian'
+        result = await handleAntrian(env, sender, inboxid)
+      }
+      // KOMISI
+      else if (upperMsg === 'KOMISI') {
+        action = 'komisi'
+        result = await handleKomisi(env, sender, inboxid)
+      }
+      // HELP
+      else if (upperMsg === 'HELP' || upperMsg === 'MENU' || upperMsg === 'BANTUAN') {
+        action = 'help'
+        const helpMsg = `💈 *BarberKas* — ${env.BARBERSHOP_NAME || 'Barbershop'}\n\n` +
+          `Perintah yang tersedia:\n\n` +
+          `✂️ *POTONG [harga] [layanan]*\n   Catat transaksi potong\n   Contoh: POTONG 30000 FADE\n\n` +
+          `📊 *TOTAL*\n   Lihat laporan hari ini\n\n` +
+          `💰 *KOMISI*\n   Lihat komisi kamu hari ini\n\n` +
+          `📋 *ANTRI*\n   Cek estimasi antrian\n\n` +
+          `❓ *HELP*\n   Tampilkan menu ini`
+        const sendResult = await sendWhatsApp(env, sender, helpMsg, inboxid)
+        result = sendResult?.status ? 'sent' : 'send_failed'
+      }
+      // DEFAULT - unknown command
+      else {
+        action = 'default'
+        const sendResult = await sendWhatsApp(env, sender,
+          `Halo ${name || 'Bro'}! Saya *BarberKas Bot* 💈\n\nKetik *HELP* untuk lihat menu perintah.`, inboxid)
+        result = sendResult?.status ? 'sent' : 'send_failed'
+      }
+    } catch (handlerErr: any) {
+      console.error(`[WEBHOOK] Handler error for action=${action}:`, handlerErr.message)
+      result = 'handler_error'
+      logEntry.error = handlerErr.message
     }
     
-    // FLOW: TOTAL / LAPORAN
-    if (upperMsg === 'TOTAL' || upperMsg === 'LAPORAN' || upperMsg === 'LAP') {
-      const result = await handleLaporan(env, sender)
-      return c.json({ status: 'ok', action: 'laporan', result })
-    }
+    // STEP 5: Log result
+    logEntry.action = action
+    logEntry.replyStatus = result
+    await logWebhook(env, logEntry)
     
-    // FLOW: ANTRI / ANTRIAN
-    if (upperMsg === 'ANTRI' || upperMsg === 'ANTRIAN') {
-      const result = await handleAntrian(env, sender)
-      return c.json({ status: 'ok', action: 'antrian', result })
-    }
-    
-    // FLOW: KOMISI
-    if (upperMsg === 'KOMISI') {
-      const result = await handleKomisi(env, sender)
-      return c.json({ status: 'ok', action: 'komisi', result })
-    }
-    
-    // FLOW: HELP
-    if (upperMsg === 'HELP' || upperMsg === 'MENU' || upperMsg === 'BANTUAN') {
-      const helpMsg = `💈 *BarberKas* — ${env.BARBERSHOP_NAME || 'Barbershop'}\n\n` +
-        `Perintah yang tersedia:\n\n` +
-        `✂️ *POTONG [harga] [layanan]*\n   Catat transaksi potong\n   Contoh: POTONG 30000 FADE\n\n` +
-        `📊 *TOTAL*\n   Lihat laporan hari ini\n\n` +
-        `💰 *KOMISI*\n   Lihat komisi kamu hari ini\n\n` +
-        `📋 *ANTRI*\n   Cek estimasi antrian\n\n` +
-        `❓ *HELP*\n   Tampilkan menu ini`
-      
-      await sendWhatsApp(env, sender, helpMsg)
-      return c.json({ status: 'ok', action: 'help' })
-    }
-    
-    // Default response
-    await sendWhatsApp(env, sender, 
-      `Halo! Saya *BarberKas Bot* 💈\n\nKetik *HELP* untuk lihat menu perintah.`)
-    
-    return c.json({ status: 'ok', action: 'default' })
+    return c.json({ status: 'ok', action, result })
     
   } catch (e: any) {
-    console.error('Webhook error:', e)
+    console.error('[WEBHOOK] Critical error:', e.message, e.stack)
     return c.json({ status: 'error', message: e.message }, 500)
   }
 })
@@ -267,7 +353,7 @@ app.post('/api/webhook/fonnte', async (c) => {
 // ============================================
 // HANDLER: POTONG (Record Transaction)
 // ============================================
-async function handlePotong(env: Bindings, message: string, sender: string) {
+async function handlePotong(env: Bindings, message: string, sender: string, inboxid?: string) {
   const parts = message.split(/\s+/)
   let price = 0
   let service = 'Potong'
@@ -277,7 +363,7 @@ async function handlePotong(env: Bindings, message: string, sender: string) {
   
   if (price <= 0) {
     await sendWhatsApp(env, sender,
-      `❌ Format salah!\n\nContoh:\n• POTONG 30000\n• POTONG 30000 FADE\n• POTONG 50000 POMADE`)
+      `❌ Format salah!\n\nContoh:\n• POTONG 30000\n• POTONG 30000 FADE\n• POTONG 50000 POMADE`, inboxid)
     return 'invalid_format'
   }
   
@@ -312,14 +398,14 @@ async function handlePotong(env: Bindings, message: string, sender: string) {
     `   Revenue: Rp ${formatRupiah(totalHariIni)}\n` +
     `   Komisi (${komisiPersen}%): Rp ${formatRupiah(komisi)}`
   
-  await sendWhatsApp(env, sender, reply)
+  await sendWhatsApp(env, sender, reply, inboxid)
   return 'recorded'
 }
 
 // ============================================
 // HANDLER: LAPORAN (Daily Report)
 // ============================================
-async function handleLaporan(env: Bindings, sender: string) {
+async function handleLaporan(env: Bindings, sender: string, inboxid?: string) {
   const today = getTodayJakarta()
   const shopName = env.BARBERSHOP_NAME || 'Barbershop'
   
@@ -328,7 +414,7 @@ async function handleLaporan(env: Bindings, sender: string) {
   
   if (!txs || txs.length === 0) {
     await sendWhatsApp(env, sender,
-      `📊 *LAPORAN HARI INI*\n${shopName}\n📅 ${formatDateIndo(today)}\n\n_Belum ada transaksi hari ini._`)
+      `📊 *LAPORAN HARI INI*\n${shopName}\n📅 ${formatDateIndo(today)}\n\n_Belum ada transaksi hari ini._`, inboxid)
     return 'empty'
   }
   
@@ -364,14 +450,14 @@ async function handleLaporan(env: Bindings, sender: string) {
   laporan += `\n💵 Komisi total (${komisiPersen}%): Rp ${formatRupiah(totalKomisi)}\n` +
     `🏦 Profit owner: *Rp ${formatRupiah(profit)}*`
   
-  await sendWhatsApp(env, sender, laporan)
+  await sendWhatsApp(env, sender, laporan, inboxid)
   return 'sent'
 }
 
 // ============================================
 // HANDLER: ANTRIAN
 // ============================================
-async function handleAntrian(env: Bindings, sender: string) {
+async function handleAntrian(env: Bindings, sender: string, inboxid?: string) {
   const today = getTodayJakarta()
   const shopName = env.BARBERSHOP_NAME || 'Barbershop'
   
@@ -404,14 +490,14 @@ async function handleAntrian(env: Bindings, sender: string) {
     `Potong terakhir 2 jam: ${recentCount}\n\n` +
     `Mau datang? Langsung aja! 😊`
   
-  await sendWhatsApp(env, sender, reply)
+  await sendWhatsApp(env, sender, reply, inboxid)
   return 'sent'
 }
 
 // ============================================
 // HANDLER: KOMISI
 // ============================================
-async function handleKomisi(env: Bindings, sender: string) {
+async function handleKomisi(env: Bindings, sender: string, inboxid?: string) {
   const today = getTodayJakarta()
   const barberName = await getBarberName(env, sender)
   const komisiPersen = parseInt(env.KOMISI_PERSEN || '50')
@@ -421,7 +507,7 @@ async function handleKomisi(env: Bindings, sender: string) {
   
   if (!txs || txs.length === 0) {
     await sendWhatsApp(env, sender,
-      `💰 *KOMISI HARI INI*\n\n👤 ${barberName}\n\n_Belum ada transaksi hari ini._`)
+      `💰 *KOMISI HARI INI*\n\n👤 ${barberName}\n\n_Belum ada transaksi hari ini._`, inboxid)
     return 'empty'
   }
   
@@ -441,7 +527,7 @@ async function handleKomisi(env: Bindings, sender: string) {
     `💰 Total revenue: Rp ${formatRupiah(totalRevenue)}\n` +
     `💵 Komisi kamu (${komisiPersen}%): *Rp ${formatRupiah(komisi)}*`
   
-  await sendWhatsApp(env, sender, reply)
+  await sendWhatsApp(env, sender, reply, inboxid)
   return 'sent'
 }
 
