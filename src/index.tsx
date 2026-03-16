@@ -28,6 +28,66 @@ const app = new Hono<{ Bindings: Bindings }>()
 app.use('/api/*', cors())
 
 // ============================================
+// WEBHOOK DEBUG & TEST ENDPOINTS
+// ============================================
+
+// GET handler for webhook URL verification (Fonnte may ping this)
+app.get('/api/webhook/fonnte', (c) => {
+  return c.json({
+    status: 'ok',
+    message: 'BarberKas Webhook is active',
+    info: 'Send POST requests to this URL from Fonnte',
+    timestamp: new Date().toISOString()
+  })
+})
+
+// Debug endpoint to test webhook without Fonnte
+app.post('/api/webhook/test', async (c) => {
+  const env = c.env
+  try {
+    const contentType = c.req.header('content-type') || ''
+    let rawBody = ''
+    let parsedData: any = {}
+    
+    if (contentType.includes('application/json')) {
+      parsedData = await c.req.json()
+      rawBody = JSON.stringify(parsedData)
+    } else {
+      parsedData = await c.req.parseBody()
+      rawBody = JSON.stringify(parsedData)
+    }
+    
+    return c.json({
+      status: 'ok',
+      received: {
+        contentType,
+        headers: Object.fromEntries(c.req.raw.headers.entries()),
+        body: parsedData,
+        rawBody
+      },
+      webhook_would_process: {
+        message: parsedData.message || parsedData.pesan || '',
+        sender: parsedData.sender || parsedData.pengirim || '',
+        device: parsedData.device || ''
+      },
+      timestamp: new Date().toISOString()
+    })
+  } catch (e: any) {
+    return c.json({ status: 'error', error: e.message }, 500)
+  }
+})
+
+// Webhook activity log (last 20 events, in-memory for debugging)
+const webhookLogs: any[] = []
+
+app.get('/api/webhook/logs', (c) => {
+  return c.json({
+    total: webhookLogs.length,
+    logs: webhookLogs.slice(-20).reverse()
+  })
+})
+
+// ============================================
 // SUPABASE HELPERS
 // ============================================
 async function supabaseQuery(env: Bindings, table: string, method: string, body?: any, query?: string) {
@@ -115,14 +175,38 @@ function formatDateIndo(dateStr: string): string {
 app.post('/api/webhook/fonnte', async (c) => {
   const env = c.env
   try {
-    const body = await c.req.parseBody()
+    // Fonnte can send as form-data OR JSON depending on config
+    const contentType = c.req.header('content-type') || ''
+    let body: any = {}
     
-    // Fonnte sends form data
-    const message = (body.message as string || '').trim()
-    const sender = (body.sender as string || '').replace(/[^0-9]/g, '')
-    const device = body.device as string || ''
+    if (contentType.includes('application/json')) {
+      body = await c.req.json()
+    } else {
+      body = await c.req.parseBody()
+    }
     
-    console.log(`Webhook received: sender=${sender}, message="${message}", device=${device}`)
+    // Fonnte field names (support both old and new API formats)
+    const message = (body.message || body.pesan || body.text || '').toString().trim()
+    const sender = (body.sender || body.pengirim || body.from || '').toString().replace(/[^0-9]/g, '')
+    const device = (body.device || body.perangkat || '').toString()
+    const name = (body.name || body.nama || '').toString()
+    
+    // Log for debugging
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      contentType,
+      sender,
+      senderName: name,
+      message,
+      device,
+      rawKeys: Object.keys(body),
+      processed: true
+    }
+    webhookLogs.push(logEntry)
+    if (webhookLogs.length > 50) webhookLogs.shift()
+    
+    console.log(`[WEBHOOK] sender=${sender}, name="${name}", message="${message}", device=${device}, contentType=${contentType}`)
+    console.log(`[WEBHOOK] Raw body keys: ${Object.keys(body).join(', ')}`)
     
     if (!message || !sender) {
       return c.json({ status: 'ignored', reason: 'empty message or sender' })
@@ -551,6 +635,13 @@ app.get('/api/health', (c) => {
 // ============================================
 app.get('/', (c) => {
   return c.html(getDashboardHTML())
+})
+
+// ============================================
+// WEBHOOK TESTER PAGE
+// ============================================
+app.get('/webhook-test', (c) => {
+  return c.html(getWebhookTestHTML())
 })
 
 function getDashboardHTML(): string {
@@ -1065,3 +1156,282 @@ function getDashboardHTML(): string {
 }
 
 export default app
+
+function getWebhookTestHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BarberKas — Webhook Tester</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    .gradient-bg { background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%); }
+  </style>
+</head>
+<body class="gradient-bg min-h-screen text-white">
+  <div class="max-w-4xl mx-auto p-4 sm:p-8">
+    
+    <div class="flex items-center gap-3 mb-8">
+      <a href="/" class="text-slate-400 hover:text-white"><i class="fas fa-arrow-left"></i></a>
+      <div class="w-10 h-10 rounded-xl bg-green-600 flex items-center justify-center">
+        <i class="fab fa-whatsapp text-white text-lg"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold">Webhook Tester</h1>
+        <p class="text-xs text-slate-400">Test webhook tanpa perlu Fonnte</p>
+      </div>
+    </div>
+
+    <!-- Quick Guide -->
+    <div class="bg-slate-800/50 rounded-2xl p-6 mb-6 border border-slate-700">
+      <h2 class="text-lg font-bold mb-4"><i class="fas fa-book mr-2 text-blue-400"></i>Panduan Setup Fonnte</h2>
+      <div class="space-y-4 text-sm text-slate-300">
+        <div class="flex gap-3">
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold">1</span>
+          <div>
+            <p class="font-semibold text-white">Login ke Fonnte</p>
+            <p>Buka <a href="https://fonnte.com" target="_blank" class="text-blue-400 underline">fonnte.com</a> dan login ke akun kamu</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold">2</span>
+          <div>
+            <p class="font-semibold text-white">Tambah Device & Scan QR</p>
+            <p>Klik <strong>Add Device</strong> > masukkan nomor HP > scan QR Code dari WA kamu</p>
+            <p class="text-yellow-400 mt-1"><i class="fas fa-exclamation-triangle mr-1"></i>Device harus status <strong>Connected</strong> (hijau)</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold">3</span>
+          <div>
+            <p class="font-semibold text-white">Set Webhook URL</p>
+            <p>Di halaman Device Settings, paste URL webhook ini:</p>
+            <div class="flex items-center gap-2 mt-2">
+              <code id="webhookUrlGuide" class="flex-1 px-3 py-2 bg-slate-900 rounded-lg text-xs text-green-400 border border-slate-600 break-all">Loading...</code>
+              <button onclick="copyText(document.getElementById('webhookUrlGuide').textContent)" class="px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs rounded-lg"><i class="fas fa-copy"></i></button>
+            </div>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold">4</span>
+          <div>
+            <p class="font-semibold text-white">Matikan Autoreply</p>
+            <p>Di Fonnte Settings: <strong>Autoreply = OFF</strong> atau set <strong>Response Source = Webhook</strong></p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-green-600 flex items-center justify-center text-xs font-bold">5</span>
+          <div>
+            <p class="font-semibold text-white">Test!</p>
+            <p>Kirim WA ke nomor Fonnte: ketik <strong>HELP</strong> atau gunakan form di bawah</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Webhook Simulator -->
+    <div class="bg-slate-800/50 rounded-2xl p-6 mb-6 border border-slate-700">
+      <h2 class="text-lg font-bold mb-4"><i class="fas fa-flask mr-2 text-purple-400"></i>Simulasi Webhook</h2>
+      <p class="text-sm text-slate-400 mb-4">Test perintah WA tanpa harus kirim dari HP:</p>
+      
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-400 mb-1">Nomor Pengirim</label>
+          <input type="text" id="testSender" value="6285712658316" class="w-full px-3 py-2 bg-slate-900 rounded-lg border border-slate-600 text-sm text-white focus:outline-none focus:border-blue-500" placeholder="628xxx">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-400 mb-1">Pesan</label>
+          <input type="text" id="testMessage" value="HELP" class="w-full px-3 py-2 bg-slate-900 rounded-lg border border-slate-600 text-sm text-white focus:outline-none focus:border-blue-500" placeholder="POTONG 30000 FADE">
+        </div>
+      </div>
+
+      <!-- Quick Command Buttons -->
+      <div class="flex flex-wrap gap-2 mb-4">
+        <button onclick="setMsg('HELP')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">HELP</button>
+        <button onclick="setMsg('POTONG 30000')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">POTONG 30000</button>
+        <button onclick="setMsg('POTONG 50000 FADE')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">POTONG 50000 FADE</button>
+        <button onclick="setMsg('TOTAL')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">TOTAL</button>
+        <button onclick="setMsg('KOMISI')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">KOMISI</button>
+        <button onclick="setMsg('ANTRI')" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">ANTRI</button>
+      </div>
+
+      <div class="flex gap-3">
+        <button onclick="simulateWebhook('form')" class="flex-1 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg font-medium transition">
+          <i class="fas fa-paper-plane mr-2"></i>Kirim (Form-Data)
+        </button>
+        <button onclick="simulateWebhook('json')" class="flex-1 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition">
+          <i class="fas fa-code mr-2"></i>Kirim (JSON)
+        </button>
+      </div>
+
+      <!-- Response -->
+      <div id="testResult" class="mt-4 hidden">
+        <p class="text-xs font-medium text-slate-400 mb-1">Response:</p>
+        <pre id="testResultContent" class="bg-slate-900 rounded-lg p-4 text-xs text-green-400 overflow-x-auto border border-slate-600 max-h-64 overflow-y-auto"></pre>
+      </div>
+    </div>
+
+    <!-- Webhook Logs -->
+    <div class="bg-slate-800/50 rounded-2xl p-6 mb-6 border border-slate-700">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-bold"><i class="fas fa-history mr-2 text-amber-400"></i>Log Webhook (Recent)</h2>
+        <button onclick="loadLogs()" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition">
+          <i class="fas fa-refresh mr-1"></i>Refresh
+        </button>
+      </div>
+      <div id="logsList" class="space-y-2 text-sm">
+        <p class="text-slate-500 italic">Klik Refresh untuk melihat log...</p>
+      </div>
+    </div>
+
+    <!-- Connection Check -->
+    <div class="bg-slate-800/50 rounded-2xl p-6 border border-slate-700">
+      <h2 class="text-lg font-bold mb-4"><i class="fas fa-stethoscope mr-2 text-red-400"></i>Status Koneksi</h2>
+      <div class="space-y-3" id="connectionStatus">
+        <div class="flex items-center gap-3 text-sm">
+          <span id="apiStatus" class="w-3 h-3 rounded-full bg-slate-600"></span>
+          <span>API Server</span>
+          <span id="apiStatusText" class="text-slate-500 ml-auto">Checking...</span>
+        </div>
+        <div class="flex items-center gap-3 text-sm">
+          <span id="supabaseStatus" class="w-3 h-3 rounded-full bg-slate-600"></span>
+          <span>Supabase Database</span>
+          <span id="supabaseStatusText" class="text-slate-500 ml-auto">Checking...</span>
+        </div>
+        <div class="flex items-center gap-3 text-sm">
+          <span id="webhookStatus" class="w-3 h-3 rounded-full bg-slate-600"></span>
+          <span>Webhook Endpoint</span>
+          <span id="webhookStatusText" class="text-slate-500 ml-auto">Checking...</span>
+        </div>
+      </div>
+      <button onclick="runChecks()" class="mt-4 px-4 py-2 bg-slate-700 hover:bg-slate-600 text-sm rounded-lg transition w-full">
+        <i class="fas fa-sync-alt mr-1"></i>Run All Checks
+      </button>
+    </div>
+
+  </div>
+
+  <script>
+    const API = '';
+
+    // Load webhook URL
+    fetch(API + '/api/config').then(r => r.json()).then(data => {
+      document.getElementById('webhookUrlGuide').textContent = data.webhookUrl || '-';
+    });
+
+    function setMsg(msg) {
+      document.getElementById('testMessage').value = msg;
+    }
+
+    function copyText(text) {
+      navigator.clipboard.writeText(text).then(() => alert('Tersalin!'));
+    }
+
+    async function simulateWebhook(type) {
+      const sender = document.getElementById('testSender').value;
+      const message = document.getElementById('testMessage').value;
+      
+      let res;
+      if (type === 'json') {
+        res = await fetch(API + '/api/webhook/fonnte', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sender, message, device: 'test-simulator', name: 'Test User' })
+        });
+      } else {
+        const formData = new FormData();
+        formData.append('sender', sender);
+        formData.append('message', message);
+        formData.append('device', 'test-simulator');
+        formData.append('name', 'Test User');
+        res = await fetch(API + '/api/webhook/fonnte', {
+          method: 'POST',
+          body: formData
+        });
+      }
+      
+      const data = await res.json();
+      document.getElementById('testResult').classList.remove('hidden');
+      document.getElementById('testResultContent').textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function loadLogs() {
+      try {
+        const res = await fetch(API + '/api/webhook/logs');
+        const data = await res.json();
+        const container = document.getElementById('logsList');
+        
+        if (!data.logs || data.logs.length === 0) {
+          container.innerHTML = '<p class="text-slate-500 italic">Belum ada log. Coba kirim pesan dulu.</p>';
+          return;
+        }
+        
+        container.innerHTML = data.logs.map(log => {
+          const time = new Date(log.timestamp).toLocaleTimeString('id-ID');
+          const bgColor = log.processed ? 'bg-green-900/30 border-green-800' : 'bg-red-900/30 border-red-800';
+          return '<div class="' + bgColor + ' border rounded-lg p-3">' +
+            '<div class="flex items-center justify-between mb-1">' +
+            '<span class="text-xs text-slate-400">' + time + '</span>' +
+            '<span class="text-xs px-2 py-0.5 rounded-full ' + (log.processed ? 'bg-green-800 text-green-300' : 'bg-red-800 text-red-300') + '">' + (log.processed ? 'OK' : 'ERROR') + '</span>' +
+            '</div>' +
+            '<p class="text-sm"><strong>' + (log.senderName || log.sender || 'unknown') + '</strong> (' + (log.sender || '-') + ')</p>' +
+            '<p class="text-xs text-slate-400 mt-1">Pesan: <strong class="text-white">' + (log.message || '-') + '</strong></p>' +
+            '<p class="text-xs text-slate-500 mt-1">Content-Type: ' + (log.contentType || '-') + ' | Keys: ' + (log.rawKeys || []).join(', ') + '</p>' +
+            '</div>';
+        }).join('');
+      } catch (e) {
+        document.getElementById('logsList').innerHTML = '<p class="text-red-400">Error: ' + e.message + '</p>';
+      }
+    }
+
+    async function runChecks() {
+      // API check
+      try {
+        const r = await fetch(API + '/api/health');
+        const d = await r.json();
+        document.getElementById('apiStatus').className = 'w-3 h-3 rounded-full bg-green-500';
+        document.getElementById('apiStatusText').textContent = 'OK - ' + d.timestamp;
+        document.getElementById('apiStatusText').className = 'text-green-400 ml-auto text-xs';
+      } catch (e) {
+        document.getElementById('apiStatus').className = 'w-3 h-3 rounded-full bg-red-500';
+        document.getElementById('apiStatusText').textContent = 'FAILED';
+        document.getElementById('apiStatusText').className = 'text-red-400 ml-auto text-xs';
+      }
+
+      // Supabase check (via transactions API)
+      try {
+        const r = await fetch(API + '/api/barbers');
+        const d = await r.json();
+        document.getElementById('supabaseStatus').className = 'w-3 h-3 rounded-full bg-green-500';
+        document.getElementById('supabaseStatusText').textContent = 'OK - ' + (d.barbers || []).length + ' barbers';
+        document.getElementById('supabaseStatusText').className = 'text-green-400 ml-auto text-xs';
+      } catch (e) {
+        document.getElementById('supabaseStatus').className = 'w-3 h-3 rounded-full bg-red-500';
+        document.getElementById('supabaseStatusText').textContent = 'FAILED';
+        document.getElementById('supabaseStatusText').className = 'text-red-400 ml-auto text-xs';
+      }
+
+      // Webhook check
+      try {
+        const r = await fetch(API + '/api/webhook/fonnte');
+        const d = await r.json();
+        document.getElementById('webhookStatus').className = 'w-3 h-3 rounded-full bg-green-500';
+        document.getElementById('webhookStatusText').textContent = 'OK - Webhook Active';
+        document.getElementById('webhookStatusText').className = 'text-green-400 ml-auto text-xs';
+      } catch (e) {
+        document.getElementById('webhookStatus').className = 'w-3 h-3 rounded-full bg-red-500';
+        document.getElementById('webhookStatusText').textContent = 'FAILED';
+        document.getElementById('webhookStatusText').className = 'text-red-400 ml-auto text-xs';
+      }
+    }
+
+    // Auto-run checks
+    runChecks();
+  </script>
+</body>
+</html>`
+}
