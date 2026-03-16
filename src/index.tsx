@@ -102,6 +102,43 @@ app.get('/api/webhook/logs', async (c) => {
   }
 })
 
+// Direct Fonnte Send API test - to diagnose send failures
+app.post('/api/test/fonnte-send', async (c) => {
+  const env = c.env
+  try {
+    const body = await c.req.json() as any
+    const target = body.target || env.OWNER_PHONE || ''
+    const message = body.message || 'Test dari BarberKas Bot 🤖'
+    
+    if (!target) return c.json({ error: 'No target phone number' }, 400)
+    
+    const result = await sendWhatsApp(env, target, message)
+    return c.json({
+      test: 'fonnte_send_api',
+      target,
+      messageLength: message.length,
+      tokenConfigured: !!env.FONNTE_TOKEN,
+      tokenLength: (env.FONNTE_TOKEN || '').length,
+      result
+    })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+// Check what Fonnte token looks like (masked for security)
+app.get('/api/test/fonnte-config', (c) => {
+  const env = c.env
+  const token = env.FONNTE_TOKEN || ''
+  return c.json({
+    tokenConfigured: !!token,
+    tokenLength: token.length,
+    tokenPreview: token ? `${token.substring(0, 4)}...${token.substring(token.length - 4)}` : 'NOT SET',
+    ownerPhone: env.OWNER_PHONE || 'NOT SET',
+    supabaseConfigured: !!env.SUPABASE_URL
+  })
+})
+
 // ============================================
 // SUPABASE HELPERS
 // ============================================
@@ -134,7 +171,7 @@ async function supabaseQuery(env: Bindings, table: string, method: string, body?
 // Based on: https://docs.fonnte.com/webhook-reply-message/
 // and: https://docs.fonnte.com/api-send-message/
 // ============================================
-async function sendWhatsApp(env: Bindings, target: string, message: string, inboxid?: string) {
+async function sendWhatsApp(env: Bindings, target: string, message: string, inboxid?: string): Promise<{status: boolean; detail?: string; reason?: string; id?: string; raw?: string}> {
   try {
     const payload: any = {
       target: target,
@@ -142,26 +179,49 @@ async function sendWhatsApp(env: Bindings, target: string, message: string, inbo
       typing: false
     }
     // If we have inboxid, include it for proper reply threading
-    if (inboxid) {
+    // Only include if it looks like a valid numeric inboxid from Fonnte
+    if (inboxid && /^\d+$/.test(inboxid)) {
       payload.inboxid = inboxid
     }
     
-    console.log(`[FONNTE SEND] target=${target}, message length=${message.length}, inboxid=${inboxid || 'none'}`)
+    const token = env.FONNTE_TOKEN || ''
+    console.log(`[FONNTE SEND] target=${target}, msgLen=${message.length}, inboxid=${inboxid || 'none'}, tokenLen=${token.length}`)
+    
+    if (!token) {
+      console.error('[FONNTE SEND] ERROR: FONNTE_TOKEN is empty!')
+      return { status: false, reason: 'FONNTE_TOKEN not configured' }
+    }
     
     const res = await fetch('https://api.fonnte.com/send', {
       method: 'POST',
       headers: {
-        'Authorization': env.FONNTE_TOKEN,
+        'Authorization': token,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
     })
-    const data = await res.json() as any
-    console.log(`[FONNTE SEND] Response: status=${data.status}, detail=${data.detail || data.reason || 'ok'}`)
+    
+    const rawText = await res.text()
+    console.log(`[FONNTE SEND] HTTP ${res.status}, Raw response: ${rawText.substring(0, 500)}`)
+    
+    let data: any
+    try {
+      data = JSON.parse(rawText)
+    } catch {
+      data = { status: false, reason: `Non-JSON response: ${rawText.substring(0, 200)}`, raw: rawText }
+    }
+    
+    // Fonnte returns: { status: true/false, detail: "...", id: "..." }
+    if (data.status === false || data.status === 'false') {
+      console.error(`[FONNTE SEND] FAILED: ${JSON.stringify(data)}`)
+    } else {
+      console.log(`[FONNTE SEND] SUCCESS: id=${data.id || 'n/a'}, detail=${data.detail || 'ok'}`)
+    }
+    
     return data
   } catch (e: any) {
-    console.error('[FONNTE SEND] Error:', e.message)
-    return { status: false, reason: e.message }
+    console.error('[FONNTE SEND] FETCH ERROR:', e.message)
+    return { status: false, reason: `fetch_error: ${e.message}` }
   }
 }
 
@@ -322,14 +382,14 @@ app.post('/api/webhook/fonnte', async (c) => {
           `📋 *ANTRI*\n   Cek estimasi antrian\n\n` +
           `❓ *HELP*\n   Tampilkan menu ini`
         const sendResult = await sendWhatsApp(env, sender, helpMsg, inboxid)
-        result = sendResult?.status ? 'sent' : 'send_failed'
+        result = sendResult?.status ? 'sent' : `send_failed:${sendResult?.reason || sendResult?.detail || JSON.stringify(sendResult).substring(0, 200)}`
       }
       // DEFAULT - unknown command
       else {
         action = 'default'
         const sendResult = await sendWhatsApp(env, sender,
           `Halo ${name || 'Bro'}! Saya *BarberKas Bot* 💈\n\nKetik *HELP* untuk lihat menu perintah.`, inboxid)
-        result = sendResult?.status ? 'sent' : 'send_failed'
+        result = sendResult?.status ? 'sent' : `send_failed:${sendResult?.reason || sendResult?.detail || JSON.stringify(sendResult).substring(0, 200)}`
       }
     } catch (handlerErr: any) {
       console.error(`[WEBHOOK] Handler error for action=${action}:`, handlerErr.message)
